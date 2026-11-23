@@ -80,16 +80,19 @@ concurrency:
 env:
   # 注意：不在顶层 env 里引用 inputs，避免 schedule/其他事件触发时上下文为空。
   DEBIAN_FRONTEND: noninteractive
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   build:
     name: HG5585F-2P5G-CT-sysupgrade-EasyMesh / build
     runs-on: ubuntu-24.04
-    timeout-minutes: 360
+    timeout-minutes: 350
 
     steps:
       - name: Checkout build assets
         uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       - name: Free disk space
         run: |
@@ -121,19 +124,61 @@ jobs:
 
       - name: Clone PonWrt source
         run: |
+          set -e
           REF="${{ inputs.source_ref || 'master' }}"
           echo "source_ref=$REF"
-          # 直接 clone 到 /mnt 的真实目录，wrt 是指向它的符号链接
-          git clone --depth=1 --single-branch --branch "$REF" \
-            https://github.com/pbs05/ponwrt.git /mnt/build_wrt/
+          # 不在 fetch 失败后静默回退分支：传错 commit 必须直接失败。
+          if printf '%s' "$REF" | grep -Eq '^[0-9a-f]{7,40}$'; then
+            git init -q /mnt/build_wrt
+            git -C /mnt/build_wrt remote add origin https://github.com/pbs05/ponwrt.git
+            git -C /mnt/build_wrt fetch -q --depth=1 origin "$REF" \
+              || { echo "ERROR: 无法 fetch commit $REF" >&2; exit 1; }
+            git -C /mnt/build_wrt checkout -q --detach FETCH_HEAD
+          else
+            git clone --depth=1 --single-branch --branch "$REF" \
+              https://github.com/pbs05/ponwrt.git /mnt/build_wrt/
+          fi
           cd "$GITHUB_WORKSPACE/wrt/"
-          echo "SOURCE_HASH=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          SOURCE_HASH=$(git rev-parse HEAD)
+          printf '%s' "$SOURCE_HASH" | grep -Eq '^[0-9a-f]{40}$' \
+            || { echo "ERROR: SOURCE_HASH 异常: $SOURCE_HASH" >&2; exit 1; }
+          echo "SOURCE_HASH=$SOURCE_HASH" >> "$GITHUB_ENV"
           echo "SOURCE_REF=$REF" >> "$GITHUB_ENV"
           echo "--- feeds.conf.default ---"
           cat feeds.conf.default
           # 确认两个 PON feed 都在
           grep -q 'pon_drivers' feeds.conf.default
           grep -q 'pon_userspace' feeds.conf.default
+
+      - name: Compute build cache keys
+        id: cache-key
+        run: |
+          bash "$GITHUB_WORKSPACE/scripts/wb-build-common.sh" key /mnt/build_wrt
+          bash "$GITHUB_WORKSPACE/scripts/wb-build-common.sh" dlkey /mnt/build_wrt
+
+      - name: Restore toolchain cache
+        id: cache-restore
+        uses: actions/cache/restore@v5
+        with:
+          key: ${{ steps.cache-key.outputs.KEY }}
+          restore-keys: ${{ steps.cache-key.outputs.PREFIX }}
+          path: |
+            /mnt/build_wrt/.ccache
+            /mnt/build_wrt/staging_dir/host*
+            /mnt/build_wrt/staging_dir/tool*
+
+      - name: Restore dl cache
+        id: dl-restore
+        if: ${{ !inputs.test_only }}
+        uses: actions/cache/restore@v5
+        with:
+          key: ${{ steps.cache-key.outputs.DL_KEY }}
+          restore-keys: ${{ steps.cache-key.outputs.DL_PREFIX }}
+          path: /mnt/build_wrt/dl
+
+      - name: Prepare restored toolchain cache
+        if: steps.cache-restore.outputs.cache-matched-key != ''
+        run: bash "$GITHUB_WORKSPACE/scripts/wb-build-common.sh" prepare /mnt/build_wrt
 
       - name: Pin APK signing key (optional)
         working-directory: wrt
@@ -252,6 +297,11 @@ jobs:
 
           cp .config "$GITHUB_WORKSPACE/Config-final.txt"
 
+      - name: Verify device package closure
+        working-directory: wrt
+        run: |
+          bash "$GITHUB_WORKSPACE/scripts/wb-build-common.sh" check-packages /mnt/build_wrt fiberhome_hg5585f-ct
+
       - name: Upload config (test_only)
         if: ${{ inputs.test_only }}
         uses: actions/upload-artifact@v6
@@ -260,16 +310,106 @@ jobs:
           path: Config-final.txt
           retention-days: 14
 
-      - name: Download sources
+      - name: Resolve build parallelism
+        id: jobs
         if: ${{ !inputs.test_only }}
-        working-directory: wrt
-        run: make download -j"$(nproc)"
+        run: echo "JOBS=$(bash "$GITHUB_WORKSPACE/scripts/wb-build-common.sh" jobs)" >> "$GITHUB_OUTPUT"
 
-      - name: Compile
+      - name: Download sources
+        id: download
         if: ${{ !inputs.test_only }}
         working-directory: wrt
         run: |
-          make -j"$(nproc)" || make -j1 V=s
+          set -e
+          JOBS="${{ steps.jobs.outputs.JOBS }}"
+          for i in 1 2 3; do
+            echo "===== download attempt $i (jobs=$JOBS) ====="
+            if make download -j"$JOBS"; then break; fi
+            [ "$i" -eq 3 ] && { echo "ERROR: make download 连续 3 次失败" >&2; exit 1; }
+            sleep 5
+          done
+          find dl -size -1024c -type f -exec rm -f {} \; 2>/dev/null || true
+
+      - name: Save dl cache
+        if: ${{ !inputs.test_only && steps.dl-restore.outputs.cache-matched-key == '' }}
+        uses: actions/cache/save@v5
+        continue-on-error: true
+        with:
+          key: ${{ steps.cache-key.outputs.DL_KEY }}
+          path: /mnt/build_wrt/dl
+
+      - name: Build tools and toolchain
+        id: toolchain
+        if: ${{ !inputs.test_only }}
+        working-directory: wrt
+        run: |
+          set -e
+          JOBS="${{ steps.jobs.outputs.JOBS }}"
+          make tools/install -j"$JOBS" || make tools/install -j1 V=s
+          make toolchain/install -j"$JOBS" || make toolchain/install -j1 V=s
+          mkdir -p tmp && echo 1 > tmp/.build
+
+      - name: Save toolchain cache (early)
+        if: ${{ !inputs.test_only && !cancelled() && steps.toolchain.outcome == 'success' && steps.cache-restore.outputs.cache-matched-key == '' }}
+        uses: actions/cache/save@v5
+        continue-on-error: true
+        with:
+          key: ${{ steps.cache-key.outputs.KEY }}
+          path: |
+            /mnt/build_wrt/.ccache
+            /mnt/build_wrt/staging_dir/host*
+            /mnt/build_wrt/staging_dir/tool*
+
+      - name: Compile
+        id: compile
+        if: ${{ !inputs.test_only }}
+        working-directory: wrt
+        run: |
+          set -o pipefail
+          JOBS="${{ steps.jobs.outputs.JOBS }}"
+          LOGDIR="$GITHUB_WORKSPACE/build-logs"
+          mkdir -p "$LOGDIR"
+          : > "$LOGDIR/build.log"
+          OK=0
+
+          if make -j"$JOBS" 2>&1 | tee -a "$LOGDIR/build.log"; then
+            OK=1
+          else
+            bash "$GITHUB_WORKSPACE/scripts/wb-build-common.sh" diagnose "$LOGDIR/build.log" || true
+            FAILED_SUB=$(grep -oE 'ERROR: [^ ]+ failed to build' "$LOGDIR/build.log" \
+              | tail -1 | sed 's/^ERROR: //; s/ failed to build$//' || true)
+            case "$FAILED_SUB" in
+              target/linux) TARGET="target/linux/install" ;;
+              package/*)    TARGET="$FAILED_SUB/compile" ;;
+              *)            TARGET="" ;;
+            esac
+            if [ -n "$TARGET" ]; then
+              echo "::group::单独重跑 $TARGET（V=s，取真错误）"
+              make -j1 V=s "$TARGET" 2>&1 | tee -a "$LOGDIR/verbose.log" || true
+              tail -80 "$LOGDIR/verbose.log" 2>/dev/null || true
+              echo "::endgroup::"
+            else
+              echo "::warning::未解析出失败子目录，保留全树 -j1 重试"
+              if make -j1 2>&1 | tee -a "$LOGDIR/build.log"; then
+                OK=1
+              fi
+            fi
+          fi
+
+          if [ "$OK" -ne 1 ]; then
+            echo "::error::编译失败 —— 真实错误见 Annotations；完整日志见 build-logs artifact"
+            exit 1
+          fi
+
+      - name: Upload build logs on failure
+        if: failure() && !inputs.test_only
+        uses: actions/upload-artifact@v6
+        continue-on-error: true
+        with:
+          name: build-logs-HG5585F-2P5G-CT-EasyMesh-${{ github.run_id }}
+          path: build-logs
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Refresh package index
         if: ${{ !inputs.test_only }}
